@@ -1,0 +1,268 @@
+---
+title: "Comparing BNSSG Migration Estimates"
+author: Luke Shaw luke.shaw4@nhs.net
+format: 
+  html:
+    #page-layout: full
+    embed-resources: true
+    toc: true
+    toc-location: left
+    toc_float: true
+    theme: cosmo
+    mainfont: Arial
+    css: styles.css
+    margin-width: 50px
+    page-width: 15
+    fig-width: 15
+    fig-height: 10
+    body-width: 2000px
+    toc-header-name: "Contents"   
+    grid: 
+      body-width: 1000px
+      sidebar-width: 350px
+      margin-width: 350px
+execute:
+  echo: false
+  warning: false
+editor: source
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r}
+#| label: libraries
+source(here::here("R/00-packages.R"))
+```
+
+
+```{r}
+#| label: setup
+#| include: false
+knitr::opts_chunk$set(
+                 external = TRUE,
+                 echo = FALSE,
+                 warning = FALSE,
+                 message = FALSE
+                )
+```
+
+# About
+
+This document compares [Admin Based Population Estimates (ABPEs)](https://www.ons.gov.uk/peoplepopulationandcommunity/populationandmigration/populationestimates/datasets/adminbasedpopulationestimatesforlocalauthoritiesinenglandandwales) that ONS produces with the empirical data seen using GP health record data in BNSSG using the [System Wide Dataset (SWD)](https://bnssghealthiertogether.org.uk/staff-and-partners/knowledge-hub/population-health-management/).
+
+This is because the Age and Core Segment distribution of people immigrating and emigrating is a key input parameter into the BNSSG [Dynamic Population Model (DPM)](https://realworlddatascience.net/case-studies/posts/2024/05/08/dpm.html), and if immigration/emigration is used instead of net migration then there is a annual churn of roughly 40% of the population, which makes the parameters a key one.
+
+```{r}
+#| label: read-data
+# for creation of parquet see R/read-wrangle-SWD-migration-estimates.R
+swd_pop_events_tbl <- read_parquet(here::here("data/swd_pop_events_tbl.parquet"))
+# for creation of parquet see R/read-wrangle-ONS-migration-estimates.R
+ons_pop_events_clean_tbl <- read_parquet(here::here("data/ons_pop_events_clean_tbl.parquet"))
+# for creation of parquet see R/read-wrangle-SWD-migration-estimates-excluding-missing.R
+swd_migrations_tbl <- read_parquet(here::here("data/swd_migrations_tbl.parquet"))
+
+# Combine them
+comb_tbl <- ons_pop_events_clean_tbl |> 
+  mutate(age = ifelse(event=="births",0,age)) |> 
+  mutate(age = ifelse(nchar(age)==1,paste0("0",age),as.character(age))) |> 
+  mutate(source = "ONS") |> 
+  filter(year==2023) |> 
+  bind_rows(
+    swd_pop_events_tbl |> 
+      mutate(source = "SWD") |> 
+      # change to 90+
+      mutate(age = ifelse(age>=90,"90+",as.character(age))) |> 
+      mutate(age = ifelse(nchar(age)==1,paste0("0",age),as.character(age))) |> 
+      summarise(num_people = sum(num_people),
+                .by=c(event, age, area, year,source))
+  ) |> 
+  bind_rows(
+    swd_migrations_tbl |> 
+      mutate(source = "SWD - known missing data excluded") |> 
+      # change to 90+
+      mutate(age = ifelse(age>=90,"90+",as.character(age))) |> 
+      mutate(age = ifelse(nchar(age)==1,paste0("0",age),as.character(age))) |> 
+      summarise(num_people = sum(num_people),
+                .by=c(event, age, area, year,source))
+  ) |> 
+  mutate(age_num = case_when(
+    age=="90+" ~ as.numeric(90),
+    TRUE ~ as.numeric(age)))
+
+```
+
+# Methodology
+
+The example period used is the year ending **June 2023**. For SWD, this means:
+
+> Anyone is seen to have *emigrated* if they were in the data set in June 2022, and not in the data set in June 2023, as well as not having being registered as dying during that period.
+
+> Anyone is seen to have *immigrated* if they were not in the data set in June 2022, and were in the data set in June 2023 (excluding those who were born during the period).
+
+There is also now a more sophisticated data set for the SWD which is called *SWD - known missing data excluded* and has the additional rules:
+
+> anyone is seen to have *emigrated* if they were classed as an emigrant by the above method *and* were not in a practice that was known not to return data in June 2023
+
+> anyone is seen to have *immigrated* if they were classed as an immigrant by the above method *and* were not in a practice that was known not to return data in June 2022
+
+The data source used for that (thanks to Fiona Budd) is available at:
+
+//BNSSG.XSWHealth.nhs.uk/CCG/Directorate/Finance/Shared Area/BNSSG - BI/6 References/9 Guidance Documents/System Wide Dataset/MissingData.xlsm
+
+
+# Compare estimates
+
+Lets look at the numbers of people seen by ABPEs and SWD for the period:
+
+```{r}
+#| label: numbers-plot
+
+age_breaks <- c(17,seq(10,90,10)) |> sort()
+
+comb_tbl |> 
+  filter(age>=17, event!="births") |> 
+  ggplot(aes(x=age_num,y=num_people, fill=source)) + 
+  # only label discrete x axis every 10 
+  scale_x_continuous(breaks = age_breaks,
+                     labels = comb_tbl |> filter(age_num%in%age_breaks) |> pull(age) |> unique()) +
+  facet_wrap(event~area, scale="free",ncol=3) + 
+  scale_fill_manual(values = c("black","red","blue")) +
+  geom_col(position="dodge") + 
+  labs(
+    x="Age",
+    y="Number of People",
+    subtitle = "SWD North Somerset emigrations due to missing GP data"
+  ) + 
+  theme(legend.position="top")
+```
+
+Things to note:
+
+1) North Somerset emigrations in SWD are likely a feature of missing data in SWD, so we should take the ONS ABPEs for that.
+2) It is surprising that SWD population estimates are oftgen higher than ONS. There is a 10% uplift applied to match GP records, but perhaps this is an overcorrection of the underreporting issue.
+3) ONS predicts much more immigrations for South Glos than SWD, whereas Bristol immigrations seem to align closely. 
+
+# Compare Migration Proportions
+
+```{r}
+#| label: migration-proportions
+
+comb_tbl |> 
+  filter(age_num>=17) |> 
+  filter(event %in% c("immigrations","emigrations")) |> 
+  mutate(event = factor(event)) |> 
+  mutate(event = fct_rev(event)) |> 
+  # group and get proportions
+  mutate(prop = num_people / sum(num_people),
+            .by=c(area, event, source)) |> 
+  ggplot(aes(x=age_num,y=prop, fill=source)) + 
+  facet_wrap(event~area, scale="free_y",ncol=3) + 
+  geom_col(position="dodge")+ 
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) + 
+  scale_fill_manual(values = c("black","red","blue")) +
+  theme(legend.position="top") + 
+  labs(x="Age",
+       y="% of total",
+       title =  "ONS estimates notably different to SWD") 
+
+```
+
+Things to note:
+
+1) Bristol aligns well
+2) North Somerset immigrations match, but not emigrations
+3) South Glos has ONS predicting more churn of younger people. This could be due to a bias in the SWD due to younger people (more likely male) not registering for GP practices when they move. 
+
+The most interesting / different of these data sets is emigrations from North Somerset. Over that time period, Mendip Vale stopped reporting. This can be seen in the below data, and the SWD known missing data does partially resolve the difference between ONS and SWD, but it only goes about half way.
+
+```{r}
+#| label: ns-emigrants
+# focus on interesting one for comparison
+comb_tbl |> 
+  filter(age_num>=17) |> 
+  filter(event %in% c("emigrations"),
+         area == "North Somerset") |> 
+  mutate(event = factor(event)) |> 
+  mutate(event = fct_rev(event)) |> 
+  mutate(num_people = round(num_people)) |> 
+  uncount(num_people)  |> 
+  ggplot(aes(x=age_num, fill=source, col=source)) + 
+  facet_wrap(event~area, scale="free_y",ncol=3) + 
+  geom_density(alpha = 0.25)   + 
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) + 
+  scale_fill_manual(values = c("black","red","blue")) +
+  scale_colour_manual(values = c("black","red","blue")) +
+  theme(legend.position="top") + 
+  labs(x="Age",
+       y="% of total",
+       title =  "ONS estimates notably different to SWD") 
+```
+
+
+# Migration Proportions - DPM input
+
+What about the profiles if looking at the inputs to the DPM?
+
+```{r}
+#| label: migration-proportions-dpm
+
+migration_proportions_for_dpm_tbl <- comb_tbl |> 
+  filter(age_num>=17) |> 
+  filter(event %in% c("immigrations","emigrations")) |> 
+  # next 3 lines group up to DPM level of ages
+  dpm:::add_age_group_column("age_num") |> 
+  dpm:::convert_to_decade("age_num_group") |> 
+  summarise(num_people = sum(num_people),
+            .by=c(year,event,area,age_num_group,source)) |> 
+  mutate(event = factor(event)) |> 
+  mutate(event = fct_rev(event)) |> 
+  # group and get proportions
+  mutate(prop = num_people / sum(num_people),
+            .by=c(area, event, source))
+
+ggplot(migration_proportions_for_dpm_tbl, aes(x=age_num_group,y=prop, fill=source)) + 
+  facet_wrap(event~area, scale="free_y",ncol=3) + 
+  geom_col(position="dodge")+ 
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) + 
+  scale_fill_manual(values = c("black","red","blue")) +
+  theme(legend.position="top") + 
+  labs(x="Age",
+       y="% of total",
+       title =  "ONS estimates notably different to SWD") 
+
+migration_proportions_for_dpm_tbl |> 
+  mutate(event = fct_rev(event)) |> 
+  arrange(event, area, source, -prop) |> 
+  mutate(prop_label = case_when(
+    prop < 0.05 ~ as.character(NA),
+    TRUE ~ paste0(round(100*prop,1),"%")
+  )) |>
+  mutate(age_num_group = fct_rev(age_num_group)) |> 
+  mutate(source = fct_relevel(source, 
+                              "SWD",
+                              "SWD - known missing data excluded",
+                              "ONS")) |> 
+  ggplot(aes(x=source,y=prop,fill=age_num_group)) + 
+  geom_col() + 
+  geom_label(aes(label=prop_label), fill="white", position = position_stack(vjust = 0.5)) +
+  facet_wrap(event~area) + 
+  coord_flip() + 
+  scale_fill_manual(values = viridis::magma(9)[1:8]) + 
+  theme(legend.position="top") +
+  # reverse fill legend order
+  guides(fill = guide_legend(reverse = TRUE,nrow=1)) +
+  labs(
+    x="Proportion",
+    y="Source",
+    fill="DPM Age Group",
+    title = "Different Migration Profiles"
+  )
+```
+
+So the next logical step is to ask the question:
+
+> How different is the DPM output if ONS immigration/emigration age-based profiles are used, with the Core Segment profiles for each age group taken as the current estimated distribution.
+
+Now we ideally mean the transition profiles of those who we've known to migrate, rather than the profiles of the general population. However, by definition we don't know their Core Segment transitions because they have migrated and so we only have one data point, not the two for comparison. Hence we are making the extra assumption:
+
+> DPM v2 assumption: by Age Year, those that migrate have the same Core Segment distribution as the general population.
